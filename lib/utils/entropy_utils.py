@@ -8,7 +8,7 @@ quantizer itself.
 from __future__ import annotations
 
 import math
-from typing import Dict, Iterable, Mapping, Sequence, Tuple
+from typing import Dict, Iterable, Mapping
 
 import torch
 
@@ -76,19 +76,14 @@ class ActivationEntropyCollector:
                     return
                 lo = float(_safe_quantile_1d(flat, 1.0 - self.clip_percentile / 100.0).item())
                 hi = float(_safe_quantile_1d(flat, self.clip_percentile / 100.0).item())
-                if layer_idx not in self._running_min:
-                    self._running_min[layer_idx] = lo
-                    self._running_max[layer_idx] = hi
-                else:
-                    self._running_min[layer_idx] = min(self._running_min[layer_idx], lo)
-                    self._running_max[layer_idx] = max(self._running_max[layer_idx], hi)
+                self._running_min[layer_idx] = min(self._running_min.get(layer_idx, lo), lo)
+                self._running_max[layer_idx] = max(self._running_max.get(layer_idx, hi), hi)
             else:
                 rows = self._channel_matrix(x)
                 lo = _safe_quantile_rows(rows, 1.0 - self.clip_percentile / 100.0).cpu()
                 hi = _safe_quantile_rows(rows, self.clip_percentile / 100.0).cpu()
                 if layer_idx not in self._running_min:
-                    self._running_min[layer_idx] = lo
-                    self._running_max[layer_idx] = hi
+                    self._running_min[layer_idx], self._running_max[layer_idx] = lo, hi
                 else:
                     self._running_min[layer_idx] = torch.minimum(self._running_min[layer_idx], lo)
                     self._running_max[layer_idx] = torch.maximum(self._running_max[layer_idx], hi)
@@ -100,117 +95,85 @@ class ActivationEntropyCollector:
                 return
             x = inputs[0].detach().float()
             if self.entropy_mode == "per_tensor":
-                lo = float(self._running_min[layer_idx])
-                hi = float(self._running_max[layer_idx])
-                if hi <= lo:
-                    hi = lo + 1e-6
+                lo = float(self._running_min[layer_idx]); hi = float(self._running_max[layer_idx])
+                if hi <= lo: hi = lo + 1e-6
                 hist = torch.histc(x.reshape(-1), bins=self.num_bins, min=lo, max=hi).cpu()
                 previous = self._histograms.get(layer_idx)
                 self._histograms[layer_idx] = hist if previous is None else previous + hist
             else:
-                rows = self._channel_matrix(x).cpu()
-                lo_vec = self._running_min[layer_idx]
-                hi_vec = self._running_max[layer_idx]
+                rows = self._channel_matrix(x).cpu(); lo_vec = self._running_min[layer_idx]; hi_vec = self._running_max[layer_idx]
                 if layer_idx not in self._histograms:
                     self._histograms[layer_idx] = torch.zeros(rows.size(0), self.num_bins)
                 for c in range(rows.size(0)):
-                    lo = float(lo_vec[c])
-                    hi = float(hi_vec[c])
-                    if hi <= lo:
-                        hi = lo + 1e-6
-                    self._histograms[layer_idx][c] += torch.histc(
-                        rows[c], bins=self.num_bins, min=lo, max=hi
-                    )
+                    lo = float(lo_vec[c]); hi = float(hi_vec[c])
+                    if hi <= lo: hi = lo + 1e-6
+                    self._histograms[layer_idx][c] += torch.histc(rows[c], bins=self.num_bins, min=lo, max=hi)
         return hook
 
     def attach_range_pass(self):
-        self.detach()
-        self._hooks = [m.register_forward_hook(self._range_hook(i))
-                       for i, m in self._iter_quantizable_modules()]
-
+        self.detach(); self._hooks = [m.register_forward_hook(self._range_hook(i)) for i, m in self._iter_quantizable_modules()]
     def attach_hist_pass(self):
-        self.detach()
-        self._hooks = [m.register_forward_hook(self._hist_hook(i))
-                       for i, m in self._iter_quantizable_modules()]
-
+        self.detach(); self._hooks = [m.register_forward_hook(self._hist_hook(i)) for i, m in self._iter_quantizable_modules()]
     def detach(self):
-        for handle in self._hooks:
-            handle.remove()
+        for handle in self._hooks: handle.remove()
         self._hooks = []
 
     @staticmethod
     def _entropy_from_hist(hist: torch.Tensor) -> float:
         total = float(hist.sum())
-        if total <= 0.0:
-            return 0.0
-        p = hist.float() / total
-        p = p[p > 0]
+        if total <= 0.0: return 0.0
+        p = hist.float() / total; p = p[p > 0]
         return float(-(p * torch.log2(p)).sum().item())
 
     def compute_entropy(self) -> Dict[int, float]:
         result = {}
         for idx, hist in self._histograms.items():
-            if self.entropy_mode == "per_tensor":
-                result[idx] = self._entropy_from_hist(hist)
+            if self.entropy_mode == "per_tensor": result[idx] = self._entropy_from_hist(hist)
             else:
                 values = [self._entropy_from_hist(hist[c]) for c in range(hist.size(0))]
                 result[idx] = float(sum(values) / len(values)) if values else 0.0
         return result
 
     def compute_per_channel_entropy(self):
-        if self.entropy_mode != "per_channel":
-            raise RuntimeError("compute_per_channel_entropy requires per_channel mode")
-        return {
-            idx: [self._entropy_from_hist(hist[c]) for c in range(hist.size(0))]
-            for idx, hist in self._histograms.items()
-        }
+        if self.entropy_mode != "per_channel": raise RuntimeError("compute_per_channel_entropy requires per_channel mode")
+        return {idx: [self._entropy_from_hist(hist[c]) for c in range(hist.size(0))] for idx, hist in self._histograms.items()}
 
 
-def run_calibration_and_get_entropy(model, calib_loader, quantizable_idx,
-                                    num_bins=256, use_cuda=True, max_batches=None,
-                                    entropy_mode="per_tensor", return_collector=False):
+def run_calibration_and_get_entropy(model, calib_loader, quantizable_idx, num_bins=256,
+                                    use_cuda=True, max_batches=None, entropy_mode="per_tensor",
+                                    clip_percentile=99.9, return_collector=False):
     """Run two deterministic passes over exactly the supplied calibration stream."""
     model.eval()
-    collector = ActivationEntropyCollector(model, quantizable_idx,
-                                           num_bins=num_bins,
-                                           entropy_mode=entropy_mode)
+    collector = ActivationEntropyCollector(model, quantizable_idx, num_bins=num_bins,
+                                           clip_percentile=clip_percentile, entropy_mode=entropy_mode)
     device = next(model.parameters()).device
     with torch.no_grad():
         collector.attach_range_pass()
         for batch_idx, (images, _) in enumerate(calib_loader):
-            if max_batches is not None and batch_idx >= max_batches:
-                break
+            if max_batches is not None and batch_idx >= max_batches: break
             model(images.to(device, non_blocking=True) if use_cuda else images)
         collector.detach()
-        if not collector._running_min:
-            raise RuntimeError("No calibration batches were observed")
+        if not collector._running_min: raise RuntimeError("No calibration batches were observed")
         collector.attach_hist_pass()
         for batch_idx, (images, _) in enumerate(calib_loader):
-            if max_batches is not None and batch_idx >= max_batches:
-                break
+            if max_batches is not None and batch_idx >= max_batches: break
             model(images.to(device, non_blocking=True) if use_cuda else images)
         collector.detach()
     entropy = collector.compute_entropy()
-    if not entropy:
-        raise RuntimeError("Entropy collector produced no layer statistics")
+    if not entropy: raise RuntimeError("Entropy collector produced no layer statistics")
     return (entropy, collector) if return_collector else entropy
 
 
-def assign_bits_by_threshold(entropy_dict: Mapping[int, float], tau: float,
-                             low_bits=(4, 4), high_bits=(8, 8)):
-    return {idx: (high_bits if float(h) >= tau else low_bits)
-            for idx, h in entropy_dict.items()}
+def assign_bits_by_threshold(entropy_dict: Mapping[int, float], tau: float, low_bits=(4, 4), high_bits=(8, 8)):
+    return {idx: (high_bits if float(h) >= tau else low_bits) for idx, h in entropy_dict.items()}
 
 
 def apply_strategy(model, quantizable_idx, strategy):
     valid = set(quantizable_idx)
     for idx, module in enumerate(model.modules()):
         if idx in valid:
-            if idx not in strategy:
-                raise KeyError(f"Missing bit strategy for quantizable layer {idx}")
-            w_bit, a_bit = strategy[idx]
-            module.w_bit = int(w_bit)
-            module.a_bit = int(a_bit)
+            if idx not in strategy: raise KeyError(f"Missing bit strategy for quantizable layer {idx}")
+            module.w_bit, module.a_bit = int(strategy[idx][0]), int(strategy[idx][1])
     return model
 
 
@@ -220,54 +183,28 @@ def pct_low_bit_layers(strategy, low_bits=(4, 4)):
 
 def estimate_compression(model, quantizable_idx, strategy, fp32_bits=32):
     """Return parameter-weighted theoretical weight-memory ratios."""
-    idx_to_module = {i: m for i, m in enumerate(model.modules())}
-    total_fp32 = total_quant = total_int8 = 0
+    idx_to_module = {i: m for i, m in enumerate(model.modules())}; total_fp32 = total_quant = total_int8 = 0
     for idx in quantizable_idx:
-        module = idx_to_module[idx]
-        weight = getattr(module, "weight", None)
-        if weight is None:
-            continue
-        n = weight.numel()
-        w_bit, _ = strategy.get(idx, (8, 8))
-        total_fp32 += n * fp32_bits
-        total_quant += n * int(w_bit)
-        total_int8 += n * 8
-    return {
-        "fp32_MB": total_fp32 / 8 / 1e6,
-        "ours_MB": total_quant / 8 / 1e6,
-        "uniform_int8_MB": total_int8 / 8 / 1e6,
-        "compression_vs_fp32": total_fp32 / total_quant if total_quant else math.inf,
-        "compression_vs_int8": total_int8 / total_quant if total_quant else math.inf,
-    }
+        weight = getattr(idx_to_module[idx], "weight", None)
+        if weight is None: continue
+        n = weight.numel(); w_bit, _ = strategy.get(idx, (8, 8))
+        total_fp32 += n * fp32_bits; total_quant += n * int(w_bit); total_int8 += n * 8
+    return {"fp32_MB": total_fp32 / 8 / 1e6, "ours_MB": total_quant / 8 / 1e6, "uniform_int8_MB": total_int8 / 8 / 1e6,
+            "compression_vs_fp32": total_fp32 / total_quant if total_quant else math.inf,
+            "compression_vs_int8": total_int8 / total_quant if total_quant else math.inf}
 
 
-def sweep_tau(model, quantizable_idx, entropy_dict, tau_candidates,
-              calibrate_fn, eval_fn, fp32_acc,
-              low_bits=(4, 4), high_bits=(8, 8),
-              max_acc_drop=0.8, min_low_bit_frac=0.6):
-    """Search tau using a selection loader; the caller must reserve the final test set."""
+def sweep_tau(model, quantizable_idx, entropy_dict, tau_candidates, calibrate_fn, eval_fn, fp32_acc,
+              low_bits=(4, 4), high_bits=(8, 8), max_acc_drop=0.8, min_low_bit_frac=0.6):
+    """Search tau using a selection loader; caller must reserve final test set."""
     candidates = [float(t) for t in tau_candidates]
-    if not candidates:
-        raise ValueError("tau_candidates must not be empty")
+    if not candidates: raise ValueError("tau_candidates must not be empty")
     results = []
     for tau in candidates:
         strategy = assign_bits_by_threshold(entropy_dict, tau, low_bits, high_bits)
-        calibrate_fn(model, strategy)
-        acc = float(eval_fn(model))
-        acc_drop = float(fp32_acc - acc)
-        low_frac = pct_low_bit_layers(strategy, low_bits)
-        feasible = bool(acc_drop <= max_acc_drop and low_frac >= min_low_bit_frac)
-        results.append({
-            "tau": tau,
-            "acc": acc,
-            "acc_drop": acc_drop,
-            "low_bit_frac": low_frac,
-            "satisfies_constraints": feasible,
-            "strategy": strategy,
-        })
+        calibrate_fn(model, strategy); acc = float(eval_fn(model)); acc_drop = float(fp32_acc - acc); low_frac = pct_low_bit_layers(strategy, low_bits)
+        results.append({"tau": tau, "acc": acc, "acc_drop": acc_drop, "low_bit_frac": low_frac,
+                        "satisfies_constraints": bool(acc_drop <= max_acc_drop and low_frac >= min_low_bit_frac), "strategy": strategy})
     feasible = [r for r in results if r["satisfies_constraints"]]
-    if feasible:
-        best = max(feasible, key=lambda r: (r["low_bit_frac"], -r["acc_drop"], -r["tau"]))
-    else:
-        best = min(results, key=lambda r: (r["acc_drop"], -r["low_bit_frac"]))
+    best = max(feasible, key=lambda r: (r["low_bit_frac"], -r["acc_drop"], -r["tau"])) if feasible else min(results, key=lambda r: (r["acc_drop"], -r["low_bit_frac"]))
     return best["tau"], results
